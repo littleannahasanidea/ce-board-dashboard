@@ -542,7 +542,7 @@
   <h1>CE BOARD EXAM DASHBOARD</h1>
   <div style="display:flex;align-items:center;gap:14px;">
     <span class="date" id="todayDate"></span>
-    <button class="avatar-btn" title="Profile">⚙</button>
+    <button class="avatar-btn" title="Storage info" id="storageInfoBtn">⚙</button>
   </div>
 </header>
 
@@ -838,6 +838,19 @@ function migrateOldImageData(){
   }
 }
 migrateOldImageData();
+
+/* Tap the gear icon to see actual storage usage/limit for this device+browser */
+$('#storageInfoBtn').onclick = async () => {
+  if(navigator.storage && navigator.storage.estimate){
+    const est = await navigator.storage.estimate();
+    const usedMB = (est.usage/1024/1024).toFixed(1);
+    const quotaMB = (est.quota/1024/1024).toFixed(0);
+    const pct = est.quota ? Math.round((est.usage/est.quota)*100) : 0;
+    alert(`Storage used: ${usedMB} MB of about ${quotaMB} MB available (${pct}%).\n\nThis is specific to this device and browser.`);
+  } else {
+    alert("This browser doesn't support checking storage usage directly.");
+  }
+};
 
 const todayISO = new Date().toISOString().slice(0,10);
 $('#todayDate').textContent = new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'});
