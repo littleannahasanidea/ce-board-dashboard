@@ -791,6 +791,54 @@ function deleteImage(id){
   getImgDB().then(db => { db.transaction('images','readwrite').objectStore('images').delete(id); }).catch(()=>{});
 }
 
+/* ---------- One-time cleanup of old data ----------
+   Before this update, images were saved directly as giant base64 text
+   inside localStorage, which fills up fast. This finds any of that old
+   data still sitting around, moves the actual image bytes into
+   IndexedDB, and replaces them with a small id — freeing up the
+   localStorage space that old data was hogging. Runs automatically,
+   safe to run every time (does nothing once everything's migrated). */
+function isDataUrl(s){ return typeof s === 'string' && s.slice(0,5) === 'data:'; }
+function migrateOldImageData(){
+  try{
+    const raw = localStorage.getItem('profilePhoto');
+    if(raw){
+      try{
+        const val = JSON.parse(raw);
+        if(isDataUrl(val)){ const id = newImgId(); saveImage(id, val); store.set('profilePhotoId', id); }
+      }catch(e){}
+      localStorage.removeItem('profilePhoto');
+    }
+  }catch(e){}
+
+  ['quizBank_q','highYield_q'].forEach(key => {
+    const qs = store.get(key, null);
+    if(Array.isArray(qs)){
+      let touched = false;
+      qs.forEach(q => { if(isDataUrl(q.figure)){ const id = newImgId(); saveImage(id, q.figure); q.figure = id; touched = true; } });
+      if(touched) store.set(key, qs);
+    }
+  });
+  ['quizBank_a','highYield_a'].forEach(key => {
+    const attempts = store.get(key, null);
+    if(Array.isArray(attempts)){
+      let touched = false;
+      attempts.forEach(a => (a.questions||[]).forEach(q => {
+        if(isDataUrl(q.figure)){ const id = newImgId(); saveImage(id, q.figure); q.figure = id; touched = true; }
+      }));
+      if(touched) store.set(key, attempts);
+    }
+  });
+
+  const entries = store.get('logEntries', null);
+  if(Array.isArray(entries)){
+    let touched = false;
+    entries.forEach(e => { if(isDataUrl(e.photo)){ const id = newImgId(); saveImage(id, e.photo); e.photo = id; touched = true; } });
+    if(touched) store.set('logEntries', entries);
+  }
+}
+migrateOldImageData();
+
 const todayISO = new Date().toISOString().slice(0,10);
 $('#todayDate').textContent = new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'});
 
