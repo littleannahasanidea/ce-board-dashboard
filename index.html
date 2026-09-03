@@ -716,29 +716,112 @@ const $ = s => document.querySelector(s);
 const $$ = s => document.querySelectorAll(s);
 const store = {
   get(k, d){ try{ const v = localStorage.getItem(k); return v ? JSON.parse(v) : d; }catch(e){ return d; } },
-  set(k, v){ localStorage.setItem(k, JSON.stringify(v)); }
+  set(k, v){
+    try{
+      localStorage.setItem(k, JSON.stringify(v));
+      return true;
+    }catch(e){
+      console.error('Storage write failed for key:', k, e);
+      alert("Your device's storage is full, so this couldn't be saved. Try deleting some old photos or exam figures (Personal Log or Quiz Bank) to free up space, then try again.");
+      return false;
+    }
+  }
 };
+
+/* Resize + re-encode an image data URL so it takes far less storage space.
+   maxDim caps the longer side in pixels; quality is JPEG compression (0-1). */
+function compressImageDataUrl(dataUrl, maxDim, quality){
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      let { width, height } = img;
+      if(width > height && width > maxDim){ height = Math.round(height * (maxDim/width)); width = maxDim; }
+      else if(height > maxDim){ width = Math.round(width * (maxDim/height)); height = maxDim; }
+      const canvas = document.createElement('canvas');
+      canvas.width = width; canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL('image/jpeg', quality));
+    };
+    img.onerror = () => resolve(dataUrl); // fall back to original if it fails to load
+    img.src = dataUrl;
+  });
+}
+
+/* ---------- Image storage (IndexedDB) ----------
+   localStorage has a hard ~5-10MB cap shared by the whole app, which photos
+   blow through fast. Actual image bytes live in IndexedDB instead (much
+   higher quota); localStorage/the rest of the app only ever holds a short
+   id string pointing at an image. imgCache mirrors IndexedDB in memory so
+   everything that renders an <img> can stay synchronous like before. */
+let imgCache = {};
+let imgDBPromise = null;
+function getImgDB(){
+  if(!imgDBPromise){
+    imgDBPromise = new Promise((resolve, reject) => {
+      const req = indexedDB.open('ceDashboardImages', 1);
+      req.onupgradeneeded = () => { req.result.createObjectStore('images', {keyPath:'id'}); };
+      req.onsuccess = () => resolve(req.result);
+      req.onerror = () => reject(req.error);
+    });
+  }
+  return imgDBPromise;
+}
+async function loadImageCache(){
+  try{
+    const db = await getImgDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction('images', 'readonly');
+      const req = tx.objectStore('images').getAll();
+      req.onsuccess = () => { (req.result||[]).forEach(rec => { imgCache[rec.id] = rec.data; }); resolve(); };
+      req.onerror = () => reject(req.error);
+    });
+  }catch(e){ console.warn('Image cache load failed:', e); }
+}
+function newImgId(){ return 'img_' + Date.now() + '_' + Math.random().toString(36).slice(2,8); }
+function imgSrc(id){ return id ? (imgCache[id] || '') : ''; }
+function saveImage(id, dataUrl){
+  imgCache[id] = dataUrl; // instant for the UI
+  getImgDB().then(db => { db.transaction('images','readwrite').objectStore('images').put({id, data:dataUrl}); })
+    .catch(e => { console.error('Failed to persist image:', e); alert("Couldn't save that image to storage. Your device may be low on space."); });
+}
+function deleteImage(id){
+  if(!id) return;
+  delete imgCache[id];
+  getImgDB().then(db => { db.transaction('images','readwrite').objectStore('images').delete(id); }).catch(()=>{});
+}
+
 const todayISO = new Date().toISOString().slice(0,10);
 $('#todayDate').textContent = new Date().toLocaleDateString('en-US',{month:'long',day:'numeric',year:'numeric'});
 
 /* ---------- Profile photo ---------- */
-const profilePhoto = store.get('profilePhoto', null);
-if(profilePhoto){ $('#profilePhoto').innerHTML = `<img src="${profilePhoto}"><div class="photo-plus" id="photoPlusBtn">+</div><input type="file" id="photoInput" accept="image/*" style="display:none">`; }
+function renderProfilePhoto(){
+  const pid = store.get('profilePhotoId', null);
+  const src = pid ? imgSrc(pid) : '';
+  $('#profilePhoto').innerHTML = src
+    ? `<img src="${src}"><div class="photo-plus" id="photoPlusBtn">+</div><input type="file" id="photoInput" accept="image/*" style="display:none">`
+    : `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="8" r="4"/><path d="M4 20c0-4 4-6 8-6s8 2 8 6"/></svg><div class="photo-plus" id="photoPlusBtn">+</div><input type="file" id="photoInput" accept="image/*" style="display:none">`;
+  wirePhotoUpload();
+}
 function wirePhotoUpload(){
   $('#photoPlusBtn').onclick = () => $('#photoInput').click();
   $('#photoInput').onchange = e => {
     const file = e.target.files[0];
     if(!file) return;
     const reader = new FileReader();
-    reader.onload = ev => {
-      store.set('profilePhoto', ev.target.result);
-      $('#profilePhoto').innerHTML = `<img src="${ev.target.result}"><div class="photo-plus" id="photoPlusBtn">+</div><input type="file" id="photoInput" accept="image/*" style="display:none">`;
-      wirePhotoUpload();
+    reader.onload = async ev => {
+      const compressed = await compressImageDataUrl(ev.target.result, 400, 0.8);
+      const oldId = store.get('profilePhotoId', null);
+      const id = newImgId();
+      saveImage(id, compressed);
+      store.set('profilePhotoId', id);
+      if(oldId) deleteImage(oldId);
+      renderProfilePhoto();
     };
     reader.readAsDataURL(file);
   };
 }
-wirePhotoUpload();
+renderProfilePhoto();
 
 /* ---------- Name / subtitle ---------- */
 $('#profName').value = store.get('profName', 'Engr. Johann Fel L. Rigor');
@@ -1473,7 +1556,7 @@ function activeHTML(bank){
         ${aq.timeLimitSec ? ringSVG('pomRing_'+bank.key, aq.remainingSec, aq.timeLimitSec) : ''}
       </div>
       <div class="quiz-question">${escapeHtml(q.text)}</div>
-      ${q.figure ? `<img src="${q.figure}" style="max-width:100%;border-radius:12px;margin:4px 0 14px;display:block;border:1px solid var(--line);">` : ''}
+      ${q.figure ? `<img src="${imgSrc(q.figure)}" style="max-width:100%;border-radius:12px;margin:4px 0 14px;display:block;border:1px solid var(--line);">` : ''}
       ${q.choices.map((c,i)=>`<button class="choice-btn ${selected===i?'selected':''}" onclick="selectChoice('${bank.key}',${i})">${escapeHtml(c)}</button>`).join('')}
       <div class="quiz-nav-row">
         <button class="btn-ghost" onclick="prevQuestion('${bank.key}')" ${aq.index===0?'disabled':''}>Back</button>
@@ -1537,7 +1620,7 @@ function bankReviewingHTML(bank){
       const sel = a.answers[q.id];
       return `<div class="review-q-block">
         <div class="qtxt">${i+1}. ${escapeHtml(q.text)}</div>
-        ${q.figure ? `<img src="${q.figure}" style="max-width:100%;border-radius:10px;margin:6px 0 10px;display:block;border:1px solid var(--line);">` : ''}
+        ${q.figure ? `<img src="${imgSrc(q.figure)}" style="max-width:100%;border-radius:10px;margin:6px 0 10px;display:block;border:1px solid var(--line);">` : ''}
         ${q.choices.map((c,ci) => {
           let cls = '';
           if(ci===q.correct) cls='correct';
@@ -1586,6 +1669,8 @@ function editQuestion(bankKey, qid){
 }
 function deleteQuestion(bankKey, qid){
   const bank = bankOf(bankKey);
+  const q = bank.getQuestions().find(q => q.id===qid);
+  if(q && q.figure) deleteImage(q.figure);
   bank.setQuestions(bank.getQuestions().filter(q => q.id!==qid));
   renderReviewSection(bankKey);
 }
@@ -1613,17 +1698,24 @@ function openQuestionModal(bankKey, existing){
     </div>`;
   function renderFigPreview(){
     $('#qf_figWrap').innerHTML = `
-      ${qf_figureData ? `<img src="${qf_figureData}" style="max-width:100%;border-radius:10px;margin-bottom:8px;display:block;border:1px solid var(--line);">` : ''}
+      ${qf_figureData ? `<img src="${imgSrc(qf_figureData)}" style="max-width:100%;border-radius:10px;margin-bottom:8px;display:block;border:1px solid var(--line);">` : ''}
       <input type="file" accept="image/*" id="qf_figInput" style="font-size:0.8rem;font-family:inherit;">
       ${qf_figureData ? `<button class="btn-ghost" id="qf_figRemove" style="font-size:0.75rem;margin-top:6px;">Remove figure</button>` : ''}`;
     $('#qf_figInput').onchange = e => {
       const file = e.target.files[0];
       if(!file) return;
       const reader = new FileReader();
-      reader.onload = ev => { qf_figureData = ev.target.result; renderFigPreview(); };
+      reader.onload = async ev => {
+        const compressed = await compressImageDataUrl(ev.target.result, 1100, 0.75);
+        const oldId = qf_figureData;
+        qf_figureData = newImgId();
+        saveImage(qf_figureData, compressed);
+        if(oldId) deleteImage(oldId);
+        renderFigPreview();
+      };
       reader.readAsDataURL(file);
     };
-    if(qf_figureData){ $('#qf_figRemove').onclick = () => { qf_figureData = null; renderFigPreview(); }; }
+    if(qf_figureData){ $('#qf_figRemove').onclick = () => { deleteImage(qf_figureData); qf_figureData = null; renderFigPreview(); }; }
   }
   renderFigPreview();
   $('#overlay').classList.add('show');
@@ -2062,6 +2154,8 @@ function upsertLogEntry(dateISO, photo, caption){
   store.set('logEntries', list);
 }
 function deleteLogEntry(dateISO){
+  const e = getLogEntry(dateISO);
+  if(e && e.photo) deleteImage(e.photo);
   store.set('logEntries', getLogEntries().filter(e => e.date!==dateISO));
 }
 function shortLogDate(iso){ return new Date(iso+'T00:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'}); }
@@ -2078,7 +2172,7 @@ function renderLogFeed(){
     </div>
     ${entries.length ? `<div class="log-grid">${entries.map(e => `
       <div class="log-tile" onclick="viewLogEntry('${e.date}')">
-        <img src="${e.photo}" alt="">
+        <img src="${imgSrc(e.photo)}" alt="">
         <div class="log-tile-date">${shortLogDate(e.date)}</div>
       </div>`).join('')}</div>` :
       `<div class="placeholder-view"><div class="emoji">📸</div><h2>No entries yet</h2><p>Add a photo and a short caption for today to start your log.</p></div>`}
@@ -2101,7 +2195,7 @@ function renderLogCalendar(){
     const isToday = iso===todayISO;
     const e = entryMap[iso];
     grid += `<div class="cal-day log-cal-day ${isToday?'today':''} ${e?'has-entry':''}" onclick="onLogDayClick('${iso}')">
-      ${e ? `<img src="${e.photo}" alt="">` : day}
+      ${e ? `<img src="${imgSrc(e.photo)}" alt="">` : day}
     </div>`;
   }
   $('#log-calendar').innerHTML = `
@@ -2145,7 +2239,12 @@ function openLogEntryModal(dateISO){
       const handleFile = file => {
         if(!file) return;
         const reader = new FileReader();
-        reader.onload = ev => { photoData = ev.target.result; renderModal(); };
+        reader.onload = async ev => {
+          const compressed = await compressImageDataUrl(ev.target.result, 900, 0.75);
+          photoData = newImgId();
+          saveImage(photoData, compressed);
+          renderModal();
+        };
         reader.readAsDataURL(file);
       };
       $('#log_cameraInput').onchange = e => handleFile(e.target.files[0]);
@@ -2153,7 +2252,7 @@ function openLogEntryModal(dateISO){
     } else {
       /* Step 2: photo set — preview, caption, save */
       box.innerHTML = `<h3>${niceLogDate(dateISO)}</h3>
-        <img src="${photoData}" style="max-width:100%;border-radius:10px;margin-bottom:8px;display:block;border:1px solid var(--line);">
+        <img src="${imgSrc(photoData)}" style="max-width:100%;border-radius:10px;margin-bottom:8px;display:block;border:1px solid var(--line);">
         <button class="btn-ghost" id="log_retake" style="font-size:0.75rem;margin-bottom:12px;">Replace photo</button>
         <label>Caption</label>
         <input class="inline-input" id="log_caption" value="${existing?escapeAttr(existing.caption||''):''}" placeholder="What happened today?">
@@ -2167,6 +2266,7 @@ function openLogEntryModal(dateISO){
       if(existing){ $('#mDelete').onclick = () => { deleteLogEntry(dateISO); $('#overlay').classList.remove('show'); refreshLogViews(); }; }
       $('#mSave').onclick = () => {
         const caption = $('#log_caption').value;
+        if(existing && existing.photo && existing.photo !== photoData) deleteImage(existing.photo);
         upsertLogEntry(dateISO, photoData, caption);
         $('#overlay').classList.remove('show');
         refreshLogViews();
@@ -2183,7 +2283,7 @@ function viewLogEntry(dateISO){
   if(!e) return;
   const box = $('#modalBox');
   box.innerHTML = `
-    <img src="${e.photo}" style="max-width:100%;border-radius:12px;margin-bottom:10px;display:block;">
+    <img src="${imgSrc(e.photo)}" style="max-width:100%;border-radius:12px;margin-bottom:10px;display:block;">
     <div style="font-size:0.78rem;color:var(--ink-dim);font-weight:700;margin-bottom:4px;">${niceLogDate(e.date)}</div>
     <div style="font-size:0.9rem;margin-bottom:14px;">${escapeHtml(e.caption||'')}</div>
     <div class="modal-actions">
@@ -2207,6 +2307,15 @@ $$('.log-nav').forEach(btn => {
 
 renderLogFeed();
 renderLogCalendar();
+
+/* Images live in IndexedDB and load asynchronously; once the cache is
+   populated, re-render the views that display photos so they appear. */
+loadImageCache().then(() => {
+  renderProfilePhoto();
+  renderReviewSection('quizBank');
+  renderReviewSection('highYield');
+  refreshLogViews();
+});
 </script>
 
 <script>
